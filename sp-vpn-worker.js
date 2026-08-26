@@ -530,8 +530,13 @@ export default {
         if (!tok) return plain("missing ?t= parameter");
         const { status, links, proxies } = await getDecoded(tok);
         if (!links.length) return plain("No nodes found in that link.");
+        // format negotiation: explicit ?fmt= wins, then Accept header, then UA
+        const fmt = (url.searchParams.get("fmt") || "").toLowerCase();
         const ua = (request.headers.get("user-agent") || "").toLowerCase();
-        if (["clash", "mihomo", "fugu", "streisand", "nyanpasu"].some((k) => ua.includes(k))) {
+        const accept = (request.headers.get("accept") || "").toLowerCase();
+        const clashClient = ["clash", "mihomo", "fugu", "streisand", "nyanpasu", "verge", "reqwest", "tauri", "clashx", "clashmeta"].some((k) => ua.includes(k));
+        const wantsYaml = fmt === "yaml" ? true : fmt === "sr" ? false : clashClient || accept.includes("yaml") || accept.includes("yml");
+        if (wantsYaml) {
           if (!proxies.length) return plain("Clash needs VLESS nodes; none found in this link.");
           return yamlRes(buildYaml(status, proxies, brand));
         }
