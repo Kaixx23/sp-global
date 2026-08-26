@@ -26,6 +26,35 @@ const CARRIER = {
   "家宽": "Home", "机房": "IDC", "广电": "Cable", "教育网": "Edu", "三线": "Tri-line", "原生": "Native",
 };
 
+// CN latency order (measured from a real mainland-China phone, 2026-08-26).
+// Used to sort the node list so Chinese clients' apps default to the fastest node.
+const CN_ORDER = [
+  ["日本•移联01", 97], ["韩国•移联01", 104], ["香港•移联02", 112], ["日本•移联02", 113],
+  ["香港•移联01", 121], ["新加坡•移联01", 131], ["台湾•移联01", 154],
+  ["日本•电信01", 182], ["德国•电信01", 187], ["新加坡•移联02", 190],
+  ["香港•电信01", 192], ["英国•电信01", 198], ["德国•移联01", 203],
+  ["美国•电信01", 228], ["英国•移联01", 229], ["新加坡•电信02", 232],
+  ["台湾•电信01", 233], ["韩国•电信01", 234], ["香港•电信02", 235],
+  ["美国•移联01", 288], ["日本•电信02", 290],
+];
+function cnSortKey(originalName) {
+  for (const [key, ms] of CN_ORDER) if (originalName.includes(key)) return ms;
+  return 9999;
+}
+function isInfoLink(originalName) {
+  return /^(剩余流量|距离下次重置|套餐到期|到期|流量)/.test(originalName);
+}
+function sortForCN(links) {
+  // info/quota nodes first (as in the original), then CN-fastest-first (stable)
+  return [...links].sort((a, b) => {
+    const an = decodeURIComponent((a.split("#").pop() || ""));
+    const bn = decodeURIComponent((b.split("#").pop() || ""));
+    const ai = isInfoLink(an) ? 0 : 1, bi = isInfoLink(bn) ? 0 : 1;
+    if (ai !== bi) return ai - bi;
+    return cnSortKey(an) - cnSortKey(bn);
+  });
+}
+
 function translateName(name) {
   let n = name;
   for (const [zh, en] of INFO_PREFIX) {
@@ -122,15 +151,19 @@ function rebrandLink(link, brand) {
 function buildShare(status, links, brand) {
   const out = [];
   if (status) out.push(status);
-  out.push("[General]", "REMARK=" + brand);
-  for (const l of links) out.push(rebrandLink(l, brand));
+  for (const l of sortForCN(links)) out.push(rebrandLink(l, brand));
   return out.join("\n") + "\n";
 }
 
 const yq = (s) => '"' + String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 
 function buildYaml(status, proxies, brand) {
-  const branded = proxies.map((p, i) => ({ ...p, disp: translateName(p.name) || brand + " " + (i + 1) }));
+  const sorted = [...proxies].sort((a, b) => {
+    const ai = isInfoLink(a.name) ? 0 : 1, bi = isInfoLink(b.name) ? 0 : 1;
+    if (ai !== bi) return ai - bi;
+    return cnSortKey(a.name) - cnSortKey(b.name);
+  });
+  const branded = sorted.map((p, i) => ({ ...p, disp: translateName(p.name) || brand + " " + (i + 1) }));
   const names = branded.map((p) => p.disp);
   const carrierNodes = {};
   branded.forEach((p) => {
