@@ -14,7 +14,7 @@
 //                            must survive byte-identical, names decodeable,
 //                            subscription-userinfo header present)
 // ============================================================================
-import worker from "../sp-vpn-worker.js";
+import worker, { fetchSubscription, FETCH_BUDGET_MS } from "../sp-vpn-worker.js";
 
 let yaml = null;
 try {
@@ -81,9 +81,25 @@ const SUPPLIER_B64 = btoa(unescape(encodeURIComponent(SUPPLIER_RAW)));
 const SUPPLIER_LINKS_ONLY = SUPPLIER_RAW; // plain variant
 
 const realFetch = globalThis.fetch;
-let supplierMode = { body: SUPPLIER_LINKS_ONLY, status: 200 };
+let supplierMode = { body: SUPPLIER_LINKS_ONLY, status: 200, delayMs: 0 };
+let supplierCalls = 0;
+// what real fetch/undici throws when AbortSignal.timeout() fires
+const timeoutError = () => Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
 globalThis.fetch = async (url, opts = {}) => {
   if (String(url).startsWith("https://supplier.example/sub")) {
+    supplierCalls++;
+    // emulate a hung supplier panel: it never answers, but it still honours the
+    // abort signal exactly like real fetch, so the worker's budget is exercised
+    if (supplierMode.delayMs > 0) {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(resolve, supplierMode.delayMs);
+        const sig = opts.signal;
+        if (!sig) return;
+        const onAbort = () => { clearTimeout(t); reject(timeoutError()); };
+        if (sig.aborted) onAbort();
+        else sig.addEventListener("abort", onAbort, { once: true });
+      });
+    }
     if (supplierMode.status !== 200) return new Response("blocked", { status: supplierMode.status });
     return new Response(supplierMode.body);
   }
@@ -96,6 +112,7 @@ const TOK = tokFor("token=main");       // section A/B/C
 const TOK_PLAIN = tokFor("token=plain"); // section D
 const TOK_INFO = tokFor("token=info");   // section E
 const TOK_BLOCK = tokFor("token=block"); // section F
+const TOK_HUNG = tokFor("token=hung");   // section H
 
 async function get(path, ua) {
   const res = await worker.fetch(new Request("https://sp.example.com" + path, { headers: ua ? { "User-Agent": ua } : {} }), {}, {});
@@ -281,6 +298,36 @@ supplierMode = { body: SUPPLIER_RAW, status: 200 };
   const r = await get(oneLink, "clash-verge-rev/2.4.1");
   ok(r.status === 200 && r.ct.includes("yaml"), "ONE link from pasted nodes serves YAML to Verge");
   if (r.ct.includes("yaml")) validateMihomo(r.body, "pasted nodes");
+}
+
+console.log("\n[H] Supplier fetch time budget (Vercel's ~10s kill → EOF / \"no recent network activity\" in apps):");
+{
+  ok(FETCH_BUDGET_MS === 7000, `supplier fetch budget is ${FETCH_BUDGET_MS}ms TOTAL (was 3 attempts × 8s = up to 24s)`);
+  ok(FETCH_BUDGET_MS + 1500 < 10000, "budget + headroom to build the response fits inside Vercel's ~10s limit");
+
+  // supplier panel that accepts the connection and then never answers
+  supplierMode = { body: SUPPLIER_LINKS_ONLY, status: 200, delayMs: 60000 };
+  supplierCalls = 0;
+  const t0 = Date.now();
+  let msg = "";
+  try { await fetchSubscription("https://supplier.example/sub?token=probe", 400); } catch (e) { msg = String(e.message); }
+  const elapsed = Date.now() - t0;
+  ok(supplierCalls === 1, `hung supplier → ${supplierCalls} attempt starts (not 3 full-timeout retries)`);
+  ok(elapsed >= 350 && elapsed < 800, `budget is a TOTAL cap: 400ms budget gave up in ${elapsed}ms, not 3 × 400ms`);
+  ok(/did not respond|timeout|timed out/i.test(msg), `gives up with a clear reason: ${msg}`);
+
+  // the real HTTP path, with the production 7s budget
+  const t1 = Date.now();
+  const r = await get(`/all/SP%20VPN?t=${TOK_HUNG}`, "clash-meta/1.18.0");
+  const routeMs = Date.now() - t1;
+  ok(r.status === 502, `hung supplier → HTTP ${r.status}, not a truncated 200 (that is the EOF the apps saw)`);
+  ok(routeMs < 9000, `/all/… answered in ${routeMs}ms — Vercel never gets to kill the function mid-response`);
+  ok(!r.body.includes("<") && /did not respond|timeout/i.test(r.body), `plain-text error the app can show: ${r.body.trim().slice(0, 70)}`);
+
+  // and the very same link recovers the moment the supplier answers again
+  supplierMode = { body: SUPPLIER_LINKS_ONLY, status: 200, delayMs: 0 };
+  const back = await get(`/all/SP%20VPN?t=${TOK_HUNG}`, "clash-meta/1.18.0");
+  ok(back.status === 200 && back.ct.includes("yaml"), `same link recovers to ${back.status} YAML as soon as the supplier answers`);
 }
 
 console.log(`\n${failures === 0 ? "🎉 ALL " + checks + " CHECKS PASSED" : "💥 " + failures + " of " + checks + " checks failed"}`);

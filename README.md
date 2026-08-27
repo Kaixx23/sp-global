@@ -31,7 +31,7 @@ that works in any VPN app (Shadowrocket, Clash, v2rayNG, NekoBox, Hiddify):
 
 ## Client compatibility matrix
 
-Verified in `test/full-proof.mjs` (282 checks) — each app's **real User-Agent** is
+Verified in `test/full-proof.mjs` (291 checks) — each app's **real User-Agent** is
 simulated, and the payload is validated with the same rules the app's engine
 enforces at import (mihomo startup checks for YAML; byte-identical link
 round-trip + `subscription-userinfo` for base64):
@@ -77,8 +77,10 @@ often translate to the same English name (香港•移联01 and 香港•移动0
   fetched, so apps show the actual reason instead of a confusing parse error
 - sends `subscription-userinfo` + `profile-web-page-url` + `profile-update-interval`
   headers, so Clash Verge / v2rayNG display live quota & expiry next to the profile
-- fetches the supplier with an 8s-per-attempt timeout so a hung panel can't
-  blow the serverless budget or the app's import timeout
+- fetches the supplier under a **7s total budget** shared by every retry attempt
+  (headers and body), so a hung panel can never outlive Vercel's ~10s limit —
+  the platform used to kill the function mid-response and Clash Meta / NekoBox /
+  v2rayNG reported `EOF` / "no recent network activity" instead of an error
 
 ## Deploy (Vercel)
 
