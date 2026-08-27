@@ -101,18 +101,33 @@ function tryDecodeB64(s) {
   return s;
 }
 
-async function fetchSubscription(url) {
+// Vercel's serverless limit is ~10s. The old code allowed 8s *per attempt*
+// across 3 User-Agents, so a hung supplier panel could run 24s: Vercel killed
+// the function mid-response and Clash Meta / NekoBox / v2rayNG saw a truncated
+// body ("EOF" / "no recent network activity") instead of an error.
+// FETCH_BUDGET_MS is therefore a TOTAL cap shared by every attempt — headers
+// and body — so we always answer with real data or a clean 502 inside the
+// platform limit, leaving headroom to build and stream the response.
+export const FETCH_BUDGET_MS = 7000;
+
+export async function fetchSubscription(url, budgetMs = FETCH_BUDGET_MS) {
   const uas = [
     "Shadowrocket/2.2.32",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
     "curl/8.5.0",
   ];
+  const deadline = Date.now() + budgetMs;
   let last = "no response";
+  let attempts = 0;
   for (const ua of uas) {
+    // Whatever is left of the *total* budget — never a fresh 8s per attempt.
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    attempts++;
     try {
-      // 8s per attempt — a hung supplier panel must not blow the whole
-      // serverless budget (Vercel ~10s) or Clash Verge's import timeout
-      const res = await fetch(url, { headers: { "User-Agent": ua }, signal: AbortSignal.timeout(8000) });
+      // The signal covers the body read too, so a supplier that sends headers
+      // and then stalls still gets cut off inside the budget.
+      const res = await fetch(url, { headers: { "User-Agent": ua }, signal: AbortSignal.timeout(remaining) });
       // strip a UTF-8 BOM (some panels prepend it — it used to break the first line)
       const rawText = (await res.text()).replace(/^\uFEFF/, "").trim();
       const text = tryDecodeB64(rawText);
@@ -124,9 +139,17 @@ async function fetchSubscription(url) {
       }
       last = "provider returned HTTP " + res.status + " with no nodes - content starts: " + rawText.slice(0, 100).replace(/\s+/g, " ");
     } catch (e) {
-      last = "fetch failed: " + e.message;
+      const timedOut = e && (e.name === "TimeoutError" || e.name === "AbortError");
+      const secs = budgetMs % 1000 === 0 ? String(budgetMs / 1000) : (budgetMs / 1000).toFixed(1);
+      last = timedOut
+        ? "supplier did not respond within " + secs + "s (timeout)"
+        : "fetch failed: " + e.message;
+      // A timeout already consumed the whole budget — retrying another UA would
+      // be the exact retry storm that used to outlive the Vercel limit.
+      if (timedOut || Date.now() >= deadline) break;
     }
   }
+  if (!attempts) last = "supplier fetch budget exhausted before any attempt";
   throw new Error(last);
 }
 
@@ -578,6 +601,9 @@ async function collectRows(brand, linksText, host) {
   const links = linksText.split(/\r?\n/).map((l) => l.trim())
     .filter((l) => l.startsWith("http://") || l.startsWith("https://") || /^[a-z0-9+.-]+:\/\//i.test(l)).slice(0, 20);
   const rows = [];
+  // Up to 20 links may be pasted here; one 7s budget is shared across all of
+  // them so a seller page can't multiply the platform limit either.
+  const deadline = Date.now() + FETCH_BUDGET_MS;
   for (const link of links) {
     const isNodeLink = !/^https?:\/\//i.test(link);
     const key = isNodeLink ? "direct:" + link : link;
@@ -589,7 +615,9 @@ async function collectRows(brand, linksText, host) {
         if (!proxies.length) { rows.push({ tok, error: "link contained no nodes" }); continue; }
         rows.push({ tok, status: "", proxies, summary: null, linksTotal: ns.length });
       } else {
-        const { status, links: ls } = await fetchSubscription(link);
+        const left = deadline - Date.now();
+        if (left <= 0) { rows.push({ tok, error: "skipped — supplier fetch budget used up by earlier links" }); continue; }
+        const { status, links: ls } = await fetchSubscription(link, left);
         if (!ls.length) { rows.push({ tok, error: "link opened but contained no nodes" }); continue; }
         const proxies = ls.map(parseNode).filter(Boolean);
         rows.push({ tok, status, proxies, summary: quotaSummary(status), linksTotal: ls.length });
