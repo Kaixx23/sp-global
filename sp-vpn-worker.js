@@ -341,7 +341,7 @@ function buildYaml(status, proxies, brand) {
   L.push("  - GEOIP,PRIVATE,DIRECT");
   L.push("  - DOMAIN-SUFFIX,cn,DIRECT");
   L.push("  - GEOIP,CN,DIRECT");
-  L.push("  - MATCH," + yq(TOP));
+  L.push("  - MATCH," + TOP);
   L.push("proxies:");
   for (const p of branded) {
     const net = normNet(p.net, p.proto);
