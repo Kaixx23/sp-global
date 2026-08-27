@@ -1,6 +1,7 @@
 // SP VPN — Netlify Functions entry.
 // Adapts a Netlify HTTP event to the worker's fetch(request) interface.
 // All routes are rewritten to this function (see netlify.toml).
+// Returns a Web Response so the streaming v2 runtime accepts the value.
 import worker from "../../sp-vpn-worker.js";
 
 const normHeaders = (headers = {}) => {
@@ -13,7 +14,7 @@ const normHeaders = (headers = {}) => {
 
 export default async (event) => {
   const method = (event.httpMethod || "GET").toUpperCase();
-  const headers = normHeaders();
+  const headers = normHeaders(event.headers);
   let body = null;
   if (["POST", "PUT", "PATCH"].includes(method)) {
     body = event.isBase64Encoded
@@ -33,9 +34,13 @@ export default async (event) => {
   }
   const request = new Request(rawUrl, { method, headers, body });
   const response = await worker.fetch(request, {}, {});
-  const out = {};
+  // The streaming v2 runtime requires a Response (or undefined). Strip a few
+  // hop-by-hop headers that the Lambda shim adds anyway.
+  const out = new Headers();
   response.headers.forEach((v, k) => {
-    if (!["content-length", "transfer-encoding", "connection", "date"].includes(k)) out[k] = v;
+    if (!["content-length", "transfer-encoding", "connection", "date"].includes(k)) {
+      out.set(k, v);
+    }
   });
-  return { statusCode: response.status, headers: out, body: await response.text() };
+  return new Response(response.body, { status: response.status, headers: out });
 };
