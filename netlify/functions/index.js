@@ -3,19 +3,35 @@
 // All routes are rewritten to this function (see netlify.toml).
 import worker from "../../sp-vpn-worker.js";
 
+const normHeaders = (headers = {}) => {
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) {
+    out[k.toLowerCase()] = Array.isArray(v) ? v.join(", ") : String(v);
+  }
+  return out;
+};
+
 export default async (event) => {
   const method = (event.httpMethod || "GET").toUpperCase();
-  const headers = {};
-  for (const [k, v] of Object.entries(event.headers || {})) {
-    headers[k] = Array.isArray(v) ? v.join(", ") : String(v);
-  }
+  const headers = normHeaders();
   let body = null;
   if (["POST", "PUT", "PATCH"].includes(method)) {
     body = event.isBase64Encoded
       ? Buffer.from(event.body || "", "base64").toString("utf8")
       : (event.body || "");
   }
-  const request = new Request(event.rawUrl, { method, headers, body });
+  // event.rawUrl only exists on direct function calls; when netlify.toml
+  // proxies a route to this function, rebuild the URL from the standard
+  // fields (original path + querystring + Host header).
+  let rawUrl = event.rawUrl;
+  if (!rawUrl) {
+    const proto = (headers["x-forwarded-proto"] || "https").split(",")[0];
+    const host = headers["x-forwarded-host"] || headers["host"] || "localhost";
+    const path = event.rawPath || event.path || "/";
+    const qs = event.querystring ? "?" + event.querystring : "";
+    rawUrl = `${proto}://${host}${path}${qs}`;
+  }
+  const request = new Request(rawUrl, { method, headers, body });
   const response = await worker.fetch(request, {}, {});
   const out = {};
   response.headers.forEach((v, k) => {
