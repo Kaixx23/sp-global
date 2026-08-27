@@ -29,6 +29,31 @@ that works in any VPN app (Shadowrocket, Clash, v2rayNG, NekoBox, Hiddify):
   CN-optimized mihomo YAML: ⚡ Auto Speed (url-test), 🔁 Failover (fallback),
   移动/电信专线 carrier groups, CN-direct rules, fake-ip DNS.
 
+## Client compatibility matrix
+
+Verified in `test/full-proof.mjs` (282 checks) — each app's **real User-Agent** is
+simulated, and the payload is validated with the same rules the app's engine
+enforces at import (mihomo startup checks for YAML; byte-identical link
+round-trip + `subscription-userinfo` for base64):
+
+| App | Receives | Status |
+|---|---|---|
+| **Clash Verge** | mihomo YAML | ✅ (use its mihomo/Meta core option) |
+| **Clash Verge Rev** | mihomo YAML | ✅ |
+| **Clash Meta for Android** | mihomo YAML | ✅ |
+| **ClashX Meta / ClashX** | mihomo YAML | ✅ Meta core (⚠️ original ClashX's EOL premium core has no vless) |
+| **FlClash** | mihomo YAML | ✅ |
+| **Stash (iOS)** | mihomo YAML | ✅ |
+| **mihomo** | mihomo YAML | ✅ |
+| **v2rayNG** | base64 SR sub | ✅ |
+| **v2rayN** | base64 SR sub | ✅ |
+| **NekoBox** | base64 SR sub | ✅ |
+| **Hiddify / HiddifyNext** | base64 SR sub | ✅ |
+| **Shadowrocket** | base64 SR sub | ✅ |
+
+For base64 apps the original share links survive **byte-identical** (only the
+node name is rebranded), so reality/ws/grpc parameters are never mangled.
+
 ## Clash compatibility (important)
 
 Clash Verge / Clash Meta / mihomo **refuse to load the whole profile** when two
@@ -39,15 +64,21 @@ often translate to the same English name (香港•移联01 and 香港•移动0
 - gives every node a **unique** display name (appends " 2", " 3", … on collision)
   and never lets a node name collide with a group name / DIRECT / REJECT / GLOBAL
 - parses **vless://, trojan:// and vmess://** links (not just vless) and keeps
-  their **ws / grpc / h2** transport options (grpc service name included)
+  their **ws / grpc / h2 / http** transport options (grpc service name, ws
+  early-data path, http Host headers, vmess legacy aid-64 & http-obfs)
+- networks mihomo-stable doesn't support (xhttp, quic) fall back to tcp so the
+  **import never fails** for the rest of the nodes
 - defaults `client-fingerprint: chrome` for REALITY nodes missing `fp=`
 - omits `external-controller` (a hardcoded port breaks Clash Verge's own controller)
 - keeps quota placeholder nodes (剩余流量…) visible in the top selector but out of
   the auto speed-test / failover groups
+- strips supplier BOM/CRLF quirks and survives stray `%` in node names
 - returns real HTTP error codes (502 + plain text) when the supplier can't be
   fetched, so apps show the actual reason instead of a confusing parse error
-- sends `subscription-userinfo` + `profile-web-page-url` headers, so Clash Verge /
-  v2rayNG display live quota & expiry next to the profile
+- sends `subscription-userinfo` + `profile-web-page-url` + `profile-update-interval`
+  headers, so Clash Verge / v2rayNG display live quota & expiry next to the profile
+- fetches the supplier with an 8s-per-attempt timeout so a hung panel can't
+  blow the serverless budget or the app's import timeout
 
 ## Deploy (Vercel)
 

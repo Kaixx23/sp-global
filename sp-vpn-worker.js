@@ -110,10 +110,14 @@ async function fetchSubscription(url) {
   let last = "no response";
   for (const ua of uas) {
     try {
-      const res = await fetch(url, { headers: { "User-Agent": ua } });
-      const rawText = (await res.text()).trim();
+      // 8s per attempt — a hung supplier panel must not blow the whole
+      // serverless budget (Vercel ~10s) or Clash Verge's import timeout
+      const res = await fetch(url, { headers: { "User-Agent": ua }, signal: AbortSignal.timeout(8000) });
+      // strip a UTF-8 BOM (some panels prepend it — it used to break the first line)
+      const rawText = (await res.text()).replace(/^\uFEFF/, "").trim();
       const text = tryDecodeB64(rawText);
-      const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      // tolerate CRLF, lone CR, and blank lines
+      const lines = text.split(/\r\n|\r|\n/).map((l) => l.trim()).filter(Boolean);
       const links = lines.filter((l) => /^[a-z0-9+.-]+:\/\//i.test(l));
       if (links.length) {
         return { status: lines.find((l) => l.startsWith("STATUS=")) || "", links };
@@ -179,13 +183,24 @@ function parseVmess(link) {
   if (!j || !j.add || !j.id) return null;
   const port = parseInt(j.port, 10);
   if (!port) return null;
+  // legacy "tcp + http obfs" links carry the real path/host in j.header
+  let net = String(j.net || "tcp").toLowerCase();
+  let path = String(j.path || "");
+  let ws_host = Array.isArray(j.host) ? String(j.host[0] || "") : String(j.host || "");
+  if (net === "tcp" && j.header && String(j.header.type || "").toLowerCase() === "http") {
+    net = "http";
+    const req = j.header.request || {};
+    path = String((Array.isArray(req.path) ? req.path[0] : req.path) || "/");
+    const h = req.headers && req.headers.Host;
+    ws_host = String((Array.isArray(h) ? h[0] : h) || ws_host);
+  }
   return {
     proto: "vmess",
     name: String(j.ps || j.remarks || ""), uuid: String(j.id), server: String(j.add), port,
     alterId: parseInt(j.aid ?? j.alterId ?? 0, 10) || 0, cipher: String(j.scy || "auto"),
-    net: String(j.net || "tcp"), security: String(j.tls || "").toLowerCase() === "tls" ? "tls" : "",
+    net, security: String(j.tls || "").toLowerCase() === "tls" ? "tls" : "",
     sni: String(j.sni || ""), fp: String(j.fp || ""), flow: "",
-    path: String(j.path || ""), ws_host: String(j.host || ""), serviceName: String(j.serviceName || ""),
+    path, ws_host, serviceName: String(j.serviceName || ""),
     insecure: String(j.insecure || j.allowInsecure || "") === "1",
   };
 }
@@ -215,10 +230,13 @@ function buildShare(status, links, brand) {
 
 const yq = (s) => '"' + String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 
-// Networks mihomo supports for vless/vmess/trojan; anything else falls back to tcp.
-function normNet(n) {
+// Networks mihomo supports at import time; anything else falls back to tcp.
+// Stable mihomo (v1.19.x, what Verge/Verge Rev/ClashX Meta/FlClash bundle) supports
+// tcp/ws/http/h2/grpc for vless+vmess, but only tcp/ws/grpc for trojan.
+function normNet(n, proto) {
   const v = String(n || "tcp").toLowerCase();
-  return ["tcp", "ws", "grpc", "h2", "http"].includes(v) ? v : "tcp";
+  const ok = proto === "trojan" ? ["tcp", "ws", "grpc"] : ["tcp", "ws", "grpc", "h2", "http"];
+  return ok.includes(v) ? v : "tcp";
 }
 
 function buildYaml(status, proxies, brand) {
@@ -326,7 +344,7 @@ function buildYaml(status, proxies, brand) {
   L.push("  - MATCH," + yq(TOP));
   L.push("proxies:");
   for (const p of branded) {
-    const net = normNet(p.net);
+    const net = normNet(p.net, p.proto);
     L.push("- name: " + yq(p.disp));
     L.push("  type: " + (p.proto === "trojan" ? "trojan" : p.proto === "vmess" ? "vmess" : "vless"));
     L.push("  server: " + yq(p.server));
@@ -367,6 +385,14 @@ function buildYaml(status, proxies, brand) {
       L.push("  h2-opts:");
       if (p.ws_host) L.push("    host: [" + yq(p.ws_host) + "]");
       if (p.path) L.push("    path: " + yq(p.path));
+    } else if (net === "http") {
+      // mihomo expects http-opts path / Host header as LISTS
+      L.push("  http-opts:");
+      L.push("    path: [" + yq(p.path || "/") + "]");
+      if (p.ws_host) {
+        L.push("    headers:");
+        L.push("      Host: [" + yq(p.ws_host) + "]");
+      }
     }
     if (p.security === "reality") {
       L.push("  reality-opts:");
