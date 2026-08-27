@@ -46,9 +46,11 @@ function isInfoLink(originalName) {
 }
 function sortForCN(links) {
   // info/quota nodes first (as in the original), then CN-fastest-first (stable)
+  // NOTE: safeDecode — a stray "%" in a node name must not crash the whole request
+  // (it used to throw URIError, which returned an HTML error page to every VPN app).
   return [...links].sort((a, b) => {
-    const an = decodeURIComponent((a.split("#").pop() || ""));
-    const bn = decodeURIComponent((b.split("#").pop() || ""));
+    const an = safeDecode(a.split("#").pop() || "");
+    const bn = safeDecode(b.split("#").pop() || "");
     const ai = isInfoLink(an) ? 0 : 1, bi = isInfoLink(bn) ? 0 : 1;
     if (ai !== bi) return ai - bi;
     return cnSortKey(an) - cnSortKey(bn);
@@ -108,10 +110,14 @@ async function fetchSubscription(url) {
   let last = "no response";
   for (const ua of uas) {
     try {
-      const res = await fetch(url, { headers: { "User-Agent": ua } });
-      const rawText = (await res.text()).trim();
+      // 8s per attempt — a hung supplier panel must not blow the whole
+      // serverless budget (Vercel ~10s) or Clash Verge's import timeout
+      const res = await fetch(url, { headers: { "User-Agent": ua }, signal: AbortSignal.timeout(8000) });
+      // strip a UTF-8 BOM (some panels prepend it — it used to break the first line)
+      const rawText = (await res.text()).replace(/^\uFEFF/, "").trim();
       const text = tryDecodeB64(rawText);
-      const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      // tolerate CRLF, lone CR, and blank lines
+      const lines = text.split(/\r\n|\r|\n/).map((l) => l.trim()).filter(Boolean);
       const links = lines.filter((l) => /^[a-z0-9+.-]+:\/\//i.test(l));
       if (links.length) {
         return { status: lines.find((l) => l.startsWith("STATUS=")) || "", links };
@@ -125,19 +131,86 @@ async function fetchSubscription(url) {
 }
 
 // ---------------- node parsing / building ----------------
+// mihomo/Clash needs a client-fingerprint for REALITY handshakes; xray links
+// almost always carry fp=, but default to chrome when missing.
+const stripBrackets = (s) => String(s).replace(/^\[/, "").replace(/\]$/, "");
+
 function parseVless(link) {
   const i = link.indexOf("#");
   const uri = i >= 0 ? link.slice(0, i) : link;
   const frag = i >= 0 ? link.slice(i + 1) : "";
-  const m = uri.match(/^vless:\/\/([^@]+)@([^:@]+):(\d+)(?:\?(.*))?$/i);
+  // server may be a bare IPv6 in [brackets] (brackets are stripped; port is outside them)
+  const m = uri.match(/^vless:\/\/([^@]+)@(\[[^\]]+\]|[^:@]+):(\d+)(?:\?(.*))?$/i);
   if (!m) return null;
   const q = new URLSearchParams(m[4] || "");
   const g = (k) => q.get(k) || "";
   return {
-    name: safeDecode(frag), uuid: m[1], server: m[2], port: parseInt(m[3], 10),
+    proto: "vless",
+    name: safeDecode(frag), uuid: m[1], server: stripBrackets(m[2]), port: parseInt(m[3], 10),
     net: g("type") || "tcp", security: g("security"), sni: g("sni"), fp: g("fp"),
     pbk: g("pbk"), sid: g("sid"), flow: g("flow"), path: g("path"), ws_host: g("host"),
+    serviceName: g("serviceName") || g("servicename"),
+    insecure: g("allowInsecure") === "1" || g("insecure") === "1",
   };
+}
+
+function parseTrojan(link) {
+  const i = link.indexOf("#");
+  const uri = i >= 0 ? link.slice(0, i) : link;
+  const frag = i >= 0 ? link.slice(i + 1) : "";
+  const m = uri.match(/^trojan:\/\/([^@]+)@(\[[^\]]+\]|[^:@]+):(\d+)(?:\?(.*))?$/i);
+  if (!m) return null;
+  const q = new URLSearchParams(m[4] || "");
+  const g = (k) => q.get(k) || "";
+  return {
+    proto: "trojan",
+    name: safeDecode(frag), password: safeDecode(m[1]), server: stripBrackets(m[2]), port: parseInt(m[3], 10),
+    net: g("type") || "tcp", security: "tls", sni: g("sni") || g("peer"), fp: g("fp"),
+    pbk: g("pbk"), sid: g("sid"), flow: "", path: g("path"), ws_host: g("host"),
+    serviceName: g("serviceName") || g("servicename"),
+    insecure: g("allowInsecure") === "1" || g("insecure") === "1",
+  };
+}
+
+function parseVmess(link) {
+  // vmess://<base64 JSON> — v2rayN/sing-box style
+  let j;
+  try {
+    let b = link.slice(8).replace(/-/g, "+").replace(/_/g, "/");
+    while (b.length % 4) b += "=";
+    j = JSON.parse(decodeURIComponent(escape(atob(b))));
+  } catch (e) { return null; }
+  if (!j || !j.add || !j.id) return null;
+  const port = parseInt(j.port, 10);
+  if (!port) return null;
+  // legacy "tcp + http obfs" links carry the real path/host in j.header
+  let net = String(j.net || "tcp").toLowerCase();
+  let path = String(j.path || "");
+  let ws_host = Array.isArray(j.host) ? String(j.host[0] || "") : String(j.host || "");
+  if (net === "tcp" && j.header && String(j.header.type || "").toLowerCase() === "http") {
+    net = "http";
+    const req = j.header.request || {};
+    path = String((Array.isArray(req.path) ? req.path[0] : req.path) || "/");
+    const h = req.headers && req.headers.Host;
+    ws_host = String((Array.isArray(h) ? h[0] : h) || ws_host);
+  }
+  return {
+    proto: "vmess",
+    name: String(j.ps || j.remarks || ""), uuid: String(j.id), server: String(j.add), port,
+    alterId: parseInt(j.aid ?? j.alterId ?? 0, 10) || 0, cipher: String(j.scy || "auto"),
+    net, security: String(j.tls || "").toLowerCase() === "tls" ? "tls" : "",
+    sni: String(j.sni || ""), fp: String(j.fp || ""), flow: "",
+    path, ws_host, serviceName: String(j.serviceName || ""),
+    insecure: String(j.insecure || j.allowInsecure || "") === "1",
+  };
+}
+
+// parse any supported share link: vless://, trojan://, vmess://
+function parseNode(link) {
+  if (/^vless:\/\//i.test(link)) return parseVless(link);
+  if (/^trojan:\/\//i.test(link)) return parseTrojan(link);
+  if (/^vmess:\/\//i.test(link)) return parseVmess(link);
+  return null;
 }
 
 function rebrandLink(link, brand) {
@@ -157,34 +230,70 @@ function buildShare(status, links, brand) {
 
 const yq = (s) => '"' + String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 
+// Networks mihomo supports at import time; anything else falls back to tcp.
+// Stable mihomo (v1.19.x, what Verge/Verge Rev/ClashX Meta/FlClash bundle) supports
+// tcp/ws/http/h2/grpc for vless+vmess, but only tcp/ws/grpc for trojan.
+function normNet(n, proto) {
+  const v = String(n || "tcp").toLowerCase();
+  const ok = proto === "trojan" ? ["tcp", "ws", "grpc"] : ["tcp", "ws", "grpc", "h2", "http"];
+  return ok.includes(v) ? v : "tcp";
+}
+
 function buildYaml(status, proxies, brand) {
-  const sorted = [...proxies].sort((a, b) => {
-    const ai = isInfoLink(a.name) ? 0 : 1, bi = isInfoLink(b.name) ? 0 : 1;
-    if (ai !== bi) return ai - bi;
-    return cnSortKey(a.name) - cnSortKey(b.name);
-  });
-  const branded = sorted.map((p, i) => ({ ...p, disp: translateName(p.name) || brand + " " + (i + 1) }));
-  const names = branded.map((p) => p.disp);
-  const carrierNodes = {};
-  branded.forEach((p) => {
-    const c = carrierOf(p.name);
-    if (c) (carrierNodes[c] = carrierNodes[c] || []).push(p.disp);
-  });
   const AUTO = "⚡ Auto Speed", FAIL = "🔁 Failover", DIRECT = "🇨🇳 Direct", TOP = "🚀 " + brand;
   const CI = { Telecom: "📡", Unicom: "📶", Mobile: "📱" };
   const CN = { Telecom: "电信", Unicom: "联通", Mobile: "移动" };
   const cgroup = (c) => `${CI[c] || ""} ${CN[c] || c}专线`;
 
+  const sorted = [...proxies].sort((a, b) => {
+    const ai = isInfoLink(a.name) ? 0 : 1, bi = isInfoLink(b.name) ? 0 : 1;
+    if (ai !== bi) return ai - bi;
+    return cnSortKey(a.name) - cnSortKey(b.name);
+  });
+
+  // --- CRITICAL: mihomo (Clash Verge / Clash Meta / ClashX) FATALLY rejects the whole
+  // config when two proxies share a name ("proxy X is the duplicate name"). Chinese
+  // names often collide after translation (香港•移联01 and 香港•移动01 both become
+  // "Hong Kong•Mobile01"), so every display name must be made unique.
+  const reserved = new Set([
+    "DIRECT", "REJECT", "REJECT-DROP", "PASS", "PASS-RULE", "COMPATIBLE", "GLOBAL",
+    AUTO, FAIL, DIRECT, TOP,
+  ]);
+  Object.keys({ Telecom: 1, Unicom: 1, Mobile: 1 }).forEach((c) => reserved.add(cgroup(c)));
+  const used = new Set(reserved);
+  const branded = [];
+  for (const p of sorted) {
+    let disp = translateName(p.name) || brand + " " + (branded.length + 1);
+    if (used.has(disp)) {
+      let k = 2;
+      while (used.has(disp + " " + k)) k++;
+      disp = disp + " " + k;
+    }
+    used.add(disp);
+    branded.push({ ...p, disp });
+  }
+
+  // Quota/info placeholder nodes stay visible in the top selector, but must NOT
+  // join speed-test / failover / carrier groups (they are fake servers).
+  const isInfo = (p) => isInfoLink(p.name);
+  const realNodes = branded.filter((p) => !isInfo(p));
+  const names = realNodes.map((p) => p.disp);
+  const carrierNodes = {};
+  realNodes.forEach((p) => {
+    const c = carrierOf(p.name);
+    if (c) (carrierNodes[c] = carrierNodes[c] || []).push(p.disp);
+  });
+  const hasAuto = names.length > 0;
+
   const L = [];
   L.push(`# ${brand} — generated for your account (live quota below)`);
   if (status) L.push("# " + status);
-  L.push(`# ${names.length} nodes · CN-optimized: auto speed-test, fallback, carrier lines, CN-direct rules`);
+  L.push(`# ${branded.length} nodes · CN-optimized: auto speed-test, fallback, carrier lines, CN-direct rules`);
   L.push(`# refreshed ${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC`);
   L.push("mixed-port: 7890");
   L.push("allow-lan: false");
   L.push("mode: rule");
   L.push("log-level: info");
-  L.push("external-controller: 127.0.0.1:9090");
   L.push("unified-delay: true");
   L.push("dns:");
   L.push("  enable: true");
@@ -197,29 +306,32 @@ function buildYaml(status, proxies, brand) {
   L.push("    geoip: true");
   L.push("    geoip-code: CN");
   L.push("proxy-groups:");
-  const topMembers = [AUTO, FAIL, DIRECT, ...Object.keys(carrierNodes).map(cgroup), ...names];
+  const topMembers = [
+    ...(hasAuto ? [AUTO, FAIL] : []),
+    DIRECT,
+    ...Object.keys(carrierNodes).map(cgroup),
+    ...branded.map((p) => p.disp),
+  ];
   L.push(`- name: ${yq(TOP)}`);
   L.push("  type: select");
   L.push("  proxies:");
   for (const n of topMembers) L.push("  - " + yq(n));
-  L.push(`- name: ${yq(AUTO)}`);
-  L.push("  type: url-test");
-  L.push("  url: http://www.gstatic.com/generate_204");
-  L.push("  interval: 300");
-  L.push("  tolerance: 80");
-  L.push("  proxies:");
-  for (const n of names) L.push("  - " + yq(n));
-  L.push(`- name: ${yq(FAIL)}`);
-  L.push("  type: fallback");
-  L.push("  url: http://www.gstatic.com/generate_204");
-  L.push("  interval: 300");
-  L.push("  proxies:");
-  for (const n of names) L.push("  - " + yq(n));
+  if (hasAuto) {
+    for (const [gname, gtype] of [[AUTO, "url-test"], [FAIL, "fallback"]]) {
+      L.push(`- name: ${yq(gname)}`);
+      L.push("  type: " + gtype);
+      L.push("  url: http://www.gstatic.com/generate_204");
+      L.push("  interval: 300");
+      if (gtype === "url-test") L.push("  tolerance: 80");
+      L.push("  proxies:");
+      for (const n of names) L.push("  - " + yq(n));
+    }
+  }
   for (const c of Object.keys(carrierNodes).sort()) {
     L.push(`- name: ${yq(cgroup(c))}`);
     L.push("  type: select");
     L.push("  proxies:");
-    L.push("  - " + yq(AUTO));
+    if (hasAuto) L.push("  - " + yq(AUTO));
     for (const n of carrierNodes[c]) L.push("  - " + yq(n));
   }
   L.push(`- name: ${yq(DIRECT)}`);
@@ -232,29 +344,60 @@ function buildYaml(status, proxies, brand) {
   L.push("  - MATCH," + yq(TOP));
   L.push("proxies:");
   for (const p of branded) {
+    const net = normNet(p.net, p.proto);
     L.push("- name: " + yq(p.disp));
-    L.push("  type: vless");
-    L.push("  server: " + p.server);
+    L.push("  type: " + (p.proto === "trojan" ? "trojan" : p.proto === "vmess" ? "vmess" : "vless"));
+    L.push("  server: " + yq(p.server));
     L.push("  port: " + p.port);
-    L.push("  uuid: " + p.uuid);
-    L.push("  network: " + p.net);
+    if (p.proto === "trojan") {
+      L.push("  password: " + yq(p.password));
+    } else {
+      L.push("  uuid: " + yq(p.uuid));
+      if (p.proto === "vmess") {
+        L.push("  alterId: " + (p.alterId || 0));
+        L.push("  cipher: " + yq(p.cipher || "auto"));
+      }
+    }
+    L.push("  network: " + net);
     L.push("  udp: true");
-    if (p.security === "tls" || p.security === "reality") L.push("  tls: true");
-    if (p.flow) L.push("  flow: " + p.flow);
-    if (p.sni) L.push("  servername: " + p.sni);
-    if (p.fp) L.push("  client-fingerprint: " + p.fp);
-    if (p.net === "ws") {
-      L.push("  ws-opts:");
-      if (p.path) L.push("    path: " + p.path);
+    const tlsOn = p.security === "tls" || p.security === "reality" || p.proto === "trojan";
+    if (tlsOn) L.push("  tls: true");
+    if (p.insecure) L.push("  skip-cert-verify: true");
+    // flow (xtls-rprx-vision) is only valid over tcp/grpc
+    if (p.flow && (net === "tcp" || net === "grpc")) L.push("  flow: " + yq(p.flow));
+    if (p.sni) L.push("  servername: " + yq(p.sni));
+    if (p.fp) L.push("  client-fingerprint: " + yq(p.fp));
+    else if (p.security === "reality") L.push("  client-fingerprint: \"chrome\"");
+    if (net === "ws") {
+      if (p.path || p.ws_host) {
+        L.push("  ws-opts:");
+        if (p.path) L.push("    path: " + yq(p.path));
+        if (p.ws_host) {
+          L.push("    headers:");
+          L.push("      Host: " + yq(p.ws_host));
+        }
+      }
+    } else if (net === "grpc") {
+      // grpc nodes without their service name can never connect — always emit the block
+      L.push("  grpc-opts:");
+      L.push("    grpc-service-name: " + yq(p.serviceName || ""));
+    } else if (net === "h2") {
+      L.push("  h2-opts:");
+      if (p.ws_host) L.push("    host: [" + yq(p.ws_host) + "]");
+      if (p.path) L.push("    path: " + yq(p.path));
+    } else if (net === "http") {
+      // mihomo expects http-opts path / Host header as LISTS
+      L.push("  http-opts:");
+      L.push("    path: [" + yq(p.path || "/") + "]");
       if (p.ws_host) {
         L.push("    headers:");
-        L.push("      Host: " + p.ws_host);
+        L.push("      Host: [" + yq(p.ws_host) + "]");
       }
     }
     if (p.security === "reality") {
       L.push("  reality-opts:");
-      if (p.pbk) L.push("    public-key: " + p.pbk);
-      if (p.sid) L.push("    short-id: " + p.sid);
+      if (p.pbk) L.push("    public-key: " + yq(p.pbk));
+      if (p.sid) L.push("    short-id: " + yq(p.sid));
     }
   }
   return L.join("\n") + "\n";
@@ -442,13 +585,13 @@ async function collectRows(brand, linksText, host) {
     try {
       if (isNodeLink) {
         const ns = link.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-        const proxies = ns.map(parseVless).filter(Boolean);
+        const proxies = ns.map(parseNode).filter(Boolean);
         if (!proxies.length) { rows.push({ tok, error: "link contained no nodes" }); continue; }
         rows.push({ tok, status: "", proxies, summary: null, linksTotal: ns.length });
       } else {
         const { status, links: ls } = await fetchSubscription(link);
         if (!ls.length) { rows.push({ tok, error: "link opened but contained no nodes" }); continue; }
-        const proxies = ls.map(parseVless).filter(Boolean);
+        const proxies = ls.map(parseNode).filter(Boolean);
         rows.push({ tok, status, proxies, summary: quotaSummary(status), linksTotal: ls.length });
       }
     } catch (e) {
@@ -469,10 +612,10 @@ async function getDecoded(tok) {
   const url = b64d(tok);
   if (url.startsWith("direct:")) {
     const ns = url.slice(7).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    d = { status: "", links: ns, proxies: ns.map(parseVless).filter(Boolean) };
+    d = { status: "", links: ns, proxies: ns.map(parseNode).filter(Boolean) };
   } else {
     const { status, links } = await fetchSubscription(url);
-    d = { status, links, proxies: links.map(parseVless).filter(Boolean) };
+    d = { status, links, proxies: links.map(parseNode).filter(Boolean) };
   }
   _cache.set(tok, { t: Date.now(), d });
   return d;
@@ -485,13 +628,39 @@ const html = (doc, title) => {
   return new Response(out, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 };
 const plain = (body, extra) => new Response(body, { headers: { "Content-Type": "text/plain; charset=utf-8", ...extra } });
-const yamlRes = (body) => new Response(body, { headers: { "Content-Type": "text/yaml; charset=utf-8" } });
+const yamlRes = (body, extra) => new Response(body, { headers: { "Content-Type": "text/yaml; charset=utf-8", ...extra } });
+// Real errors must return a real HTTP error status. Apps used to receive a 200
+// HTML page and then showed a confusing "parse error" instead of the reason.
+const plainErr = (msg, code = 502) => new Response(msg + "\n", {
+  status: code,
+  headers: { "Content-Type": "text/plain; charset=utf-8" },
+});
+
+// Standard subscription headers (subconverter spec): Clash Verge / v2rayNG show
+// live quota + expiry next to the profile, and "home page" links to the quota page.
+function subHeaders(status, pageUrl) {
+  const h = {};
+  const s = quotaSummary(status);
+  if (s) {
+    const G = 1073741824;
+    const exp = Math.floor(Date.parse(s.exp + "T00:00:00Z") / 1000);
+    h["subscription-userinfo"] =
+      `upload=${Math.round(s.up * G)}; download=${Math.round(s.down * G)}; total=${Math.round(s.tot * G)}` +
+      (exp ? `; expire=${exp}` : "");
+  }
+  if (pageUrl) {
+    h["profile-web-page-url"] = pageUrl;
+    h["profile-update-interval"] = "6";
+  }
+  return h;
+}
 
 export default {
   async fetch(request, env, ctx) {
+    let url, path;
     try {
-      const url = new URL(request.url);
-      const path = url.pathname;
+      url = new URL(request.url);
+      path = url.pathname;
       const host = `${request.headers.get("x-forwarded-proto") || "https"}://${url.host}`;
 
       if (request.method === "POST") {
@@ -527,31 +696,32 @@ export default {
       if ((m = path.match(/^\/all\/([^/?]+)$/))) {
         const brand = safeDecode(m[1]) || "SP VPN";
         const tok = url.searchParams.get("t") || "";
-        if (!tok) return plain("missing ?t= parameter");
+        if (!tok) return plainErr("missing ?t= parameter", 400);
         const { status, links, proxies } = await getDecoded(tok);
-        if (!links.length) return plain("No nodes found in that link.");
+        if (!links.length) return plainErr("No nodes found in that link.");
         // format negotiation: explicit ?fmt= wins, then Accept header, then UA
         const fmt = (url.searchParams.get("fmt") || "").toLowerCase();
         const ua = (request.headers.get("user-agent") || "").toLowerCase();
         const accept = (request.headers.get("accept") || "").toLowerCase();
-        const clashClient = ["clash", "mihomo", "fugu", "streisand", "nyanpasu", "verge", "reqwest", "tauri", "clashx", "clashmeta"].some((k) => ua.includes(k));
+        const clashClient = ["clash", "mihomo", "fugu", "streisand", "nyanpasu", "verge", "reqwest", "tauri", "clashx", "clashmeta", "stash", "flclash"].some((k) => ua.includes(k));
         const wantsYaml = fmt === "yaml" ? true : fmt === "sr" ? false : clashClient || accept.includes("yaml") || accept.includes("yml");
+        const extra = subHeaders(status, `${host}/q/${tok}`);
         if (wantsYaml) {
-          if (!proxies.length) return plain("Clash needs VLESS nodes; none found in this link.");
-          return yamlRes(buildYaml(status, proxies, brand));
+          if (!proxies.length) return plainErr("No vless://, vmess:// or trojan:// nodes found in that link — Clash apps can't use it.");
+          return yamlRes(buildYaml(status, proxies, brand), extra);
         }
-        return plain(btoa(unescape(encodeURIComponent(buildShare(status, links, brand)))));
+        return plain(btoa(unescape(encodeURIComponent(buildShare(status, links, brand)))), extra);
       }
       if ((m = path.match(/^\/sub\/([^/]+)$/))) {
         const brand = url.searchParams.get("brand") || "SP VPN";
         const { status, proxies } = await getDecoded(m[1]);
-        if (!proxies.length) return plain("No VLESS nodes found in that link.");
-        return yamlRes(buildYaml(status, proxies, brand));
+        if (!proxies.length) return plainErr("No vless://, vmess:// or trojan:// nodes found in that link — Clash apps can't use it.");
+        return yamlRes(buildYaml(status, proxies, brand), subHeaders(status, `${host}/q/${m[1]}`));
       }
       if ((m = path.match(/^\/share\/([^/]+)$/))) {
         const brand = url.searchParams.get("brand") || "SP VPN";
         const { status, links } = await getDecoded(m[1]);
-        if (!links.length) return plain("No nodes found in that link.");
+        if (!links.length) return plainErr("No nodes found in that link.");
         const body = buildShare(status, links, brand);
         if (url.searchParams.get("file") === "1")
           return plain(body, { "Content-Disposition": `attachment; filename="${(brand.toLowerCase().replace(/[^a-z0-9]+/g, "-"))}.txt"` });
@@ -560,13 +730,18 @@ export default {
       if ((m = path.match(/^\/sr\/([^/?]+)$/))) {
         const brand = safeDecode(m[1]) || "SP VPN";
         const tok = url.searchParams.get("t") || "";
-        if (!tok) return plain("missing ?t= parameter");
+        if (!tok) return plainErr("missing ?t= parameter", 400);
         const { status, links } = await getDecoded(tok);
-        if (!links.length) return plain("No nodes found in that link.");
-        return plain(btoa(unescape(encodeURIComponent(buildShare(status, links, brand)))));
+        if (!links.length) return plainErr("No nodes found in that link.");
+        return plain(btoa(unescape(encodeURIComponent(buildShare(status, links, brand)))), subHeaders(status, `${host}/q/${tok}`));
       }
       return html(errorPage("Not found"));
     } catch (e) {
+      // subscription endpoints: return a plain-text error with a 5xx status so
+      // Clash/v2ray apps display the actual reason instead of failing to parse HTML
+      if (/^\/(all|sub|sr|share)\//.test(path)) {
+        return plainErr("Couldn't read that link — it may be invalid or expired. (" + String(e.message) + ")");
+      }
       return html(errorPage("Couldn't read that link — it may be invalid or expired.<br>(" + String(e.message).replace(/</g, "&lt;") + ")"));
     }
   },
